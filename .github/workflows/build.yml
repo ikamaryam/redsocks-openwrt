@@ -19,7 +19,10 @@ jobs:
             https://archive.openwrt.org/releases/19.07.10/targets/ramips/mt76x8/openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz
 
           tar -xf openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz
-          mv openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64 sdk
+
+          mv \
+            openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64 \
+            sdk
 
       - name: Prepare SDK feeds
         working-directory: sdk
@@ -43,56 +46,68 @@ jobs:
           p = Path("http-connect.c")
           s = p.read_text()
 
-          old = '"CONNECT %s:%u HTTP/1.0\\r\\n"'
-          new = '"CONNECT %s:%u HTTP/1.0\\r\\nHost: %s:%u\\r\\n\\r\\n"'
+          old = '''evbuffer_add_printf(buff, "CONNECT %s:%u HTTP/1.0\\r\\n", host, ntohs(destaddr->sin_port));'''
+
+          new = '''evbuffer_add_printf(
+              buff,
+              "CONNECT %s:%u HTTP/1.0\\r\\n"
+              "Host: %s:%u\\r\\n"
+              "\\r\\n",
+              host,
+              ntohs(destaddr->sin_port),
+              host,
+              ntohs(destaddr->sin_port)
+          );'''
 
           if old not in s:
-              raise SystemExit("CONNECT format string not found")
+              print("Original CONNECT code was not found.")
+              print("Matching lines:")
+              for line in s.splitlines():
+                  if "CONNECT %s" in line:
+                      print(line)
+              raise SystemExit(1)
 
           s = s.replace(old, new, 1)
           p.write_text(s)
 
-          print("Patched CONNECT format:")
-          for line in s.splitlines():
-              if "CONNECT %s" in line:
-                  print(line)
+          print("Patch successful.")
           PY
 
-      - name: Fix arguments for Host header
+      - name: Verify patch
         run: |
-          cd redsocks
+          grep -n -A 10 -B 3 'CONNECT %s' redsocks/http-connect.c
 
-          python3 <<'PY'
-          from pathlib import Path
-
-          p = Path("http-connect.c")
-          s = p.read_text()
-
-          needle = 'evbuffer_add_printf(buff, "CONNECT %s:%u HTTP/1.0\\r\\nHost: %s:%u\\r\\n\\r\\n", host, ntohs(destaddr->sin_port));'
-
-          replacement = 'evbuffer_add_printf(buff, "CONNECT %s:%u HTTP/1.0\\r\\nHost: %s:%u\\r\\n\\r\\n", host, ntohs(destaddr->sin_port), host, ntohs(destaddr->sin_port));'
-
-          if needle in s:
-              s = s.replace(needle, replacement, 1)
-
-          p.write_text(s)
-          PY
-
-           - name: Cross compile
+      - name: Locate libevent
         run: |
-          TOOLCHAIN="$GITHUB_WORKSPACE/sdk/staging_dir/toolchain-mipsel_24kc_gcc-7.5.0_musl"
-          TARGET="$GITHUB_WORKSPACE/sdk/staging_dir/target-mipsel_24kc_musl"
-
           export STAGING_DIR="$GITHUB_WORKSPACE/sdk/staging_dir"
+
+          find "$STAGING_DIR" -name event.h -print
+          find "$STAGING_DIR" -name 'libevent_core.so*' -print
+
+          test -f \
+            "$STAGING_DIR/target-mipsel_24kc_musl/usr/include/event.h"
+
+          test -e \
+            "$STAGING_DIR/target-mipsel_24kc_musl/usr/lib/libevent_core.so"
+
+      - name: Cross compile
+        run: |
+          export STAGING_DIR="$GITHUB_WORKSPACE/sdk/staging_dir"
+
+          TOOLCHAIN="$STAGING_DIR/toolchain-mipsel_24kc_gcc-7.5.0_musl"
+          TARGET="$STAGING_DIR/target-mipsel_24kc_musl"
 
           CC="$TOOLCHAIN/bin/mipsel-openwrt-linux-musl-gcc"
           STRIP="$TOOLCHAIN/bin/mipsel-openwrt-linux-musl-strip"
 
-          echo "Compiler: $CC"
-          echo "Target: $TARGET"
+          echo "Compiler:"
+          "$CC" --version
 
-          test -f "$TARGET/usr/include/event.h"
-          test -f "$TARGET/usr/lib/libevent_core.so"
+          echo "Target include:"
+          ls -l "$TARGET/usr/include/event.h"
+
+          echo "Target library:"
+          ls -l "$TARGET/usr/lib/libevent_core.so"*
 
           cd redsocks
 
@@ -106,14 +121,22 @@ jobs:
 
           "$STRIP" redsocks
 
+          echo "Result:"
           file redsocks
           ls -lh redsocks
 
           mkdir -p "$GITHUB_WORKSPACE/output"
           cp redsocks "$GITHUB_WORKSPACE/output/redsocks-patched"
-          
+
+      - name: Verify binary
+        run: |
+          file output/redsocks-patched
+          ls -lh output/redsocks-patched
+          sha256sum output/redsocks-patched
+
       - name: Upload patched binary
         uses: actions/upload-artifact@v4
         with:
           name: redsocks-openwrt-mipsel-24kc
           path: output/redsocks-patched
+          if-no-files-found: error
