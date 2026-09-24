@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Install build tools
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -19,47 +19,60 @@ jobs:
             file \
             python3
 
-      - name: Download OpenWrt 19.07.10 SDK
+      - name: Download OpenWrt SDK
         run: |
           wget -q --show-progress \
             https://archive.openwrt.org/releases/19.07.10/targets/ramips/mt76x8/openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz
 
-          tar -xf \
-            openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz
+          tar -xf openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz
 
           mv \
             openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64 \
             sdk
 
-      - name: Configure OpenWrt feeds
-        working-directory: sdk
-        env:
-          FORCE: "1"
+      - name: Download OpenWrt libevent binary
         run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install libevent
+          mkdir -p libevent-ipk
+          cd libevent-ipk
 
-      - name: Build libevent in SDK
-        working-directory: sdk
-        env:
-          FORCE: "1"
+          wget -q --show-progress \
+            https://archive.openwrt.org/releases/19.07.10/packages/mipsel_24kc/base/libevent2-core7_2.1.11-1_mipsel_24kc.ipk
+
+          ar x libevent2-core7_2.1.11-1_mipsel_24kc.ipk
+
+          mkdir root
+          tar -xf data.tar.gz -C root
+
+          find root -type f -o -type l
+
+          LIB="$(find root/usr/lib -name 'libevent_core-*.so.*' -o -name 'libevent_core.so.*' | head -1)"
+
+          test -n "$LIB"
+
+          ln -sf "$(basename "$LIB")" root/usr/lib/libevent_core.so
+
+          ls -l root/usr/lib/
+
+      - name: Download libevent headers
         run: |
-          make FORCE=1 defconfig
-          make FORCE=1 package/libevent/compile V=s -j2
+          wget -q --show-progress \
+            https://github.com/libevent/libevent/releases/download/release-2.1.11-stable/libevent-2.1.11-stable.tar.gz
 
-      - name: Download redsocks source
+          tar -xzf libevent-2.1.11-stable.tar.gz
+
+          test -f libevent-2.1.11-stable/include/event.h
+
+      - name: Download redsocks 0.5
         run: |
           git clone https://github.com/darkk/redsocks.git
           cd redsocks
 
-          git checkout release-0.5 || \
-          git checkout v0.5 || \
-          true
+          git checkout release-0.5 || git checkout v0.5 || true
 
           echo "Original CONNECT code:"
-          grep -n -A 5 -B 3 'CONNECT %s' http-connect.c
+          grep -n -A 6 -B 3 'CONNECT %s' http-connect.c
 
-      - name: Patch HTTP CONNECT Host header
+      - name: Patch CONNECT Host header
         run: |
           cd redsocks
 
@@ -71,83 +84,65 @@ jobs:
           s = p.read_text()
 
           pattern = re.compile(
-              r'len\s*=\s*evbuffer_add_printf'
-              r'\(\s*buff\s*,\s*'
-              r'"CONNECT %s:%u HTTP/1\.0\\r\\n"\s*,'
-              r'\s*host\s*,\s*'
-              r'ntohs\s*\(\s*destaddr->sin_port\s*\)\s*'
+              r'len\s*=\s*evbuffer_add_printf\s*\(\s*'
+              r'buff\s*,\s*'
+              r'"CONNECT %s:%u HTTP/1\.0\\r\\n"\s*,\s*'
+              r'host\s*,\s*ntohs\s*\(\s*destaddr->sin_port\s*\)\s*'
               r'\)\s*;',
               re.MULTILINE
           )
 
-          replacement = '''len = evbuffer_add_printf(buff,
-                  "CONNECT %s:%u HTTP/1.0\\r\\n"
-                  "Host: %s:%u\\r\\n"
-                  "\\r\\n",
-                  host, ntohs(destaddr->sin_port),
-                  host, ntohs(destaddr->sin_port));'''
+          replacement = (
+              'len = evbuffer_add_printf(buff, '
+              '"CONNECT %s:%u HTTP/1.0\\\\r\\\\n'
+              'Host: %s:%u\\\\r\\\\n\\\\r\\\\n",\\n'
+              '\\t\\thost, ntohs(destaddr->sin_port),\\n'
+              '\\t\\thost, ntohs(destaddr->sin_port));'
+          )
 
-          s2, count = pattern.subn(replacement, s, count=1)
+          patched, count = pattern.subn(
+              lambda m: replacement,
+              s,
+              count=1
+          )
 
           if count != 1:
-              print("ERROR: CONNECT block could not be patched.")
-              print()
+              print("ERROR: CONNECT block tidak ditemukan")
               for i, line in enumerate(s.splitlines(), 1):
                   if "CONNECT %s" in line:
-                      start = max(0, i - 4)
-                      end = min(len(s.splitlines()), i + 6)
-                      for n in range(start, end):
-                          print(f"{n+1}: {s.splitlines()[n]}")
+                      print("Line", i, ":", line)
               raise SystemExit(1)
 
-          p.write_text(s2)
-
-          print("Patch successful.")
+          p.write_text(patched)
+          print("PATCH BERHASIL")
           PY
 
-      - name: Verify Host patch
+      - name: Verify patch
         run: |
-          grep -n -A 10 -B 3 'CONNECT %s' redsocks/http-connect.c
+          grep -n -A 8 -B 3 'CONNECT %s' redsocks/http-connect.c
           grep -n 'Host: %s' redsocks/http-connect.c
 
-      - name: Locate OpenWrt toolchain and libevent
-        run: |
-          export STAGING_DIR="$GITHUB_WORKSPACE/sdk/staging_dir"
-
-          echo "Toolchains:"
-          find "$STAGING_DIR" -maxdepth 1 -type d -name 'toolchain-*' -print
-
-          echo "event.h:"
-          find "$STAGING_DIR" -name event.h -print
-
-          echo "libevent:"
-          find "$STAGING_DIR" -name 'libevent_core.so*' -print
-
-      - name: Cross compile patched redsocks
+      - name: Cross compile redsocks
         run: |
           export STAGING_DIR="$GITHUB_WORKSPACE/sdk/staging_dir"
 
           TOOLCHAIN="$STAGING_DIR/toolchain-mipsel_24kc_gcc-7.5.0_musl"
-          TARGET="$STAGING_DIR/target-mipsel_24kc_musl"
-
           CC="$TOOLCHAIN/bin/mipsel-openwrt-linux-musl-gcc"
           STRIP="$TOOLCHAIN/bin/mipsel-openwrt-linux-musl-strip"
 
+          EVENT_SRC="$GITHUB_WORKSPACE/libevent-2.1.11-stable"
+          EVENT_LIB="$GITHUB_WORKSPACE/libevent-ipk/root/usr/lib"
+
           test -x "$CC"
           test -x "$STRIP"
-          test -f "$TARGET/usr/include/event.h"
-
-          EVENTLIB="$(find "$TARGET/usr/lib" \
-            -name 'libevent_core.so*' \
-            -print -quit)"
-
-          test -n "$EVENTLIB"
+          test -f "$EVENT_SRC/include/event.h"
+          test -e "$EVENT_LIB/libevent_core.so"
 
           echo "Compiler:"
           "$CC" --version
 
           echo "libevent:"
-          echo "$EVENTLIB"
+          ls -l "$EVENT_LIB"
 
           cd redsocks
 
@@ -155,8 +150,8 @@ jobs:
 
           make \
             CC="$CC" \
-            CFLAGS="-Os -I$TARGET/usr/include" \
-            LDFLAGS="-L$TARGET/usr/lib" \
+            CFLAGS="-Os -I$EVENT_SRC/include" \
+            LDFLAGS="-L$EVENT_LIB" \
             LIBS="-levent_core"
 
           "$STRIP" redsocks
@@ -164,13 +159,14 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/output"
           cp redsocks "$GITHUB_WORKSPACE/output/redsocks-patched"
 
-      - name: Verify compiled binary
+      - name: Verify binary
         run: |
           file output/redsocks-patched
           ls -lh output/redsocks-patched
           sha256sum output/redsocks-patched
 
-          strings output/redsocks-patched | grep -A 2 'CONNECT %s' || true
+          echo "CONNECT strings:"
+          strings output/redsocks-patched | grep -E 'CONNECT|Host:' || true
 
       - name: Upload patched binary
         uses: actions/upload-artifact@v4
