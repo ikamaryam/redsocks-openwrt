@@ -8,16 +8,11 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-
-      # ============================================================
-      # 1. Install kebutuhan build
-      # ============================================================
       - name: Install build tools
         run: |
-          set -eux
+          set -euxo pipefail
 
           sudo apt-get update
-
           sudo apt-get install -y \
             build-essential \
             git \
@@ -31,29 +26,18 @@ jobs:
             file \
             python3
 
-
-      # ============================================================
-      # 2. Download SDK OpenWrt 19.07.10
-      #    SDK hanya dipakai untuk cross compiler.
-      #    TIDAK menjalankan make defconfig / feeds / package compile.
-      # ============================================================
       - name: Download OpenWrt SDK
         run: |
-          set -eux
+          set -euxo pipefail
 
           SDK_FILE="openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz"
-
-          SDK_URL="https://archive.openwrt.org/releases/19.07.10/targets/ramips/mt76x8/${SDK_FILE}"
 
           wget \
             --tries=3 \
             --timeout=30 \
             --show-progress \
-            -O sdk.tar.xz \
-            "${SDK_URL}"
-
-          echo "8e4a8f2de37938d5f78ab8ec07567f094214eec69dc71ba46158e716656b94c9  sdk.tar.xz" \
-            | sha256sum -c -
+            "https://archive.openwrt.org/releases/19.07.10/targets/ramips/mt76x8/${SDK_FILE}" \
+            -O sdk.tar.xz
 
           tar -xJf sdk.tar.xz
 
@@ -63,21 +47,15 @@ jobs:
 
           test -d sdk/staging_dir
 
-          echo "SDK OK"
-
-
-      # ============================================================
-      # 3. Cari toolchain MIPS OpenWrt
-      # ============================================================
       - name: Setup MIPS toolchain
         run: |
-          set -eux
+          set -euxo pipefail
 
           TOOLCHAIN="$(find "$GITHUB_WORKSPACE/sdk/staging_dir" \
             -maxdepth 1 \
             -type d \
             -name 'toolchain-mipsel_24kc_gcc-7.5.0_musl*' \
-            | head -n 1)"
+            | head -n1)"
 
           test -n "$TOOLCHAIN"
 
@@ -104,19 +82,11 @@ jobs:
 
           echo "$TOOLCHAIN/bin" >> "$GITHUB_PATH"
 
-          echo "======================================"
-          echo "Cross compiler ditemukan:"
           "$CC" --version
-          echo "======================================"
 
-
-      # ============================================================
-      # 4. Download libevent 2.1.11 source
-      #    Sama dengan versi router Anda.
-      # ============================================================
       - name: Download libevent 2.1.11
         run: |
-          set -eux
+          set -euxo pipefail
 
           git clone \
             --depth 1 \
@@ -124,25 +94,11 @@ jobs:
             https://github.com/libevent/libevent.git \
             libevent-src
 
-          cd libevent-src
+          test -f libevent-src/include/event.h
 
-          git rev-parse HEAD
-
-          test -f include/event.h
-
-          echo "libevent source OK"
-
-
-      # ============================================================
-      # 5. Cross compile HANYA libevent_core secara static
-      #
-      #    Tidak menggunakan OpenWrt feeds.
-      #    Tidak menggunakan Python 2.
-      #    Tidak menggunakan IPK.
-      # ============================================================
-      - name: Cross compile static libevent
+      - name: Cross compile libevent
         run: |
-          set -eux
+          set -euxo pipefail
 
           cd "$GITHUB_WORKSPACE/libevent-src"
 
@@ -158,26 +114,31 @@ jobs:
             --host=mipsel-openwrt-linux-musl \
             --disable-shared \
             --enable-static \
-            --disable-openssl
+            --disable-openssl \
+            --disable-samples \
+            --disable-libevent-regress
 
-          make -j2 libevent_core.la
+          echo "=== GENERATE BUILT HEADERS ==="
 
-          test -f .libs/libevent_core.a
-          test -f include/event.h
+          make -j1 include/event2/event-config.h
+
           test -f include/event2/event-config.h
 
-          echo "======================================"
-          echo "LIBEVENT STATIC BERHASIL"
+          echo "=== EVENT CONFIG CREATED ==="
+          ls -lh include/event2/event-config.h
+
+          echo "=== BUILD LIBEVENT ==="
+
+          make -j2
+
+          test -f .libs/libevent_core.a
+
+          echo "=== LIBEVENT OK ==="
           ls -lh .libs/libevent_core.a
-          echo "======================================"
 
-
-      # ============================================================
-      # 6. Download redsocks release 0.5
-      # ============================================================
       - name: Download redsocks 0.5
         run: |
-          set -eux
+          set -euxo pipefail
 
           git clone \
             --depth 1 \
@@ -187,121 +148,85 @@ jobs:
 
           cd redsocks
 
-          echo "======================================"
-          echo "CONNECT ORIGINAL:"
-          grep -n -A5 -B2 'CONNECT %s:%u' http-connect.c
-          echo "======================================"
+          grep -n -A8 -B3 'CONNECT %s:%u' http-connect.c
 
-
-      # ============================================================
-      # 7. Patch Host header
-      #
-      # ORIGINAL:
-      #
-      # CONNECT IP:PORT HTTP/1.0
-      #
-      # MENJADI:
-      #
-      # CONNECT IP:PORT HTTP/1.0
-      # Host: IP:PORT
-      #
-      # Ini yang dibutuhkan HTTP Custom :7071
-      # ============================================================
-      - name: Patch HTTP CONNECT Host header
+      - name: Patch Host header
         run: |
-          set -eux
+          set -euxo pipefail
 
           cd "$GITHUB_WORKSPACE/redsocks"
 
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("http-connect.c")
           text = path.read_text()
 
-          old = '''\
-          	len = evbuffer_add_printf(buff, "CONNECT %s:%u HTTP/1.0\\r\\n",
-          		inet_ntoa(client->destaddr.sin_addr),
-          		ntohs(client->destaddr.sin_port));\
-          '''
+          pattern = re.compile(
+              r'len\s*=\s*evbuffer_add_printf\s*'
+              r'\(\s*buff\s*,\s*'
+              r'"CONNECT %s:%u HTTP/1\.0\\r\\n"\s*,\s*'
+              r'inet_ntoa\s*\(\s*client->destaddr\.sin_addr\s*\)\s*,\s*'
+              r'ntohs\s*\(\s*client->destaddr\.sin_port\s*\)\s*'
+              r'\)\s*;',
+              re.MULTILINE
+          )
 
-          new = '''\
-          	len = evbuffer_add_printf(buff,
-          		"CONNECT %s:%u HTTP/1.0\\r\\n"
-          		"Host: %s:%u\\r\\n",
-          		inet_ntoa(client->destaddr.sin_addr),
-          		ntohs(client->destaddr.sin_port),
-          		inet_ntoa(client->destaddr.sin_addr),
-          		ntohs(client->destaddr.sin_port));\
-          '''
+          replacement = '''len = evbuffer_add_printf(buff,
+              "CONNECT %s:%u HTTP/1.0\\\\r\\\\n"
+              "Host: %s:%u\\\\r\\\\n"
+              "\\\\r\\\\n",
+              inet_ntoa(client->destaddr.sin_addr),
+              ntohs(client->destaddr.sin_port),
+              inet_ntoa(client->destaddr.sin_addr),
+              ntohs(client->destaddr.sin_port));'''
 
-          if old not in text:
-              print("====================================")
-              print("ERROR: SOURCE CONNECT TIDAK SESUAI")
-              print("====================================")
+          patched, count = pattern.subn(
+              lambda m: replacement,
+              text,
+              count=1
+          )
 
-              for number, line in enumerate(text.splitlines(), 1):
+          if count != 1:
+              print("PATCH GAGAL: CONNECT block tidak ditemukan")
+
+              lines = text.splitlines()
+
+              for i, line in enumerate(lines, 1):
                   if "CONNECT %s:%u" in line:
-                      start = max(1, number - 3)
-                      end = number + 6
+                      start = max(1, i - 4)
+                      end = min(len(lines), i + 8)
 
-                      lines = text.splitlines()
-
-                      for n in range(start, min(end, len(lines)) + 1):
+                      for n in range(start, end + 1):
                           print(f"{n}: {lines[n-1]}")
 
               raise SystemExit(1)
 
-          text = text.replace(old, new, 1)
+          path.write_text(patched)
 
-          path.write_text(text)
-
-          print("====================================")
-          print("PATCH HOST HEADER BERHASIL")
-          print("====================================")
+          print("PATCH BERHASIL")
           PY
 
-
-      # ============================================================
-      # 8. Pastikan patch benar SEBELUM compile
-      # ============================================================
-      - name: Verify source patch
+      - name: Verify patch
         run: |
-          set -eux
+          set -euxo pipefail
 
           cd "$GITHUB_WORKSPACE/redsocks"
 
-          echo "======================================"
-          echo "HASIL PATCH:"
-          echo "======================================"
-
           grep -n -A10 -B3 'CONNECT %s:%u' http-connect.c
-
-          echo
-          echo "======================================"
-          echo "CEK HOST HEADER:"
-          echo "======================================"
-
           grep -n 'Host: %s:%u' http-connect.c
 
-
-      # ============================================================
-      # 9. Compile redsocks
-      #
-      # libevent_core.a dimasukkan LANGSUNG ke binary.
-      #
-      # Jadi redsocks hasil akhir TIDAK bergantung kepada
-      # libevent runtime saat dijalankan.
-      # ============================================================
-      - name: Cross compile patched redsocks
+      - name: Compile patched redsocks
         run: |
-          set -eux
+          set -euxo pipefail
 
-          EVENT_INCLUDE="$GITHUB_WORKSPACE/libevent-src/include"
-          EVENT_STATIC="$GITHUB_WORKSPACE/libevent-src/.libs/libevent_core.a"
+          EVENT_DIR="$GITHUB_WORKSPACE/libevent-src"
+          EVENT_LIB="$EVENT_DIR/.libs/libevent_core.a"
 
-          test -f "$EVENT_INCLUDE/event.h"
-          test -f "$EVENT_STATIC"
+          test -f "$EVENT_DIR/include/event.h"
+          test -f "$EVENT_DIR/include/event2/event-config.h"
+          test -f "$EVENT_LIB"
 
           cd "$GITHUB_WORKSPACE/redsocks"
 
@@ -309,9 +234,9 @@ jobs:
 
           make \
             CC="$CC" \
-            CFLAGS="-Os -ffunction-sections -fdata-sections -I$EVENT_INCLUDE" \
+            CFLAGS="-Os -ffunction-sections -fdata-sections -I$EVENT_DIR/include" \
             LDFLAGS="-Wl,--gc-sections" \
-            LIBS="$EVENT_STATIC"
+            LIBS="$EVENT_LIB"
 
           test -f redsocks
 
@@ -322,76 +247,32 @@ jobs:
           cp redsocks \
             "$GITHUB_WORKSPACE/output/redsocks-patched"
 
-
-      # ============================================================
-      # 10. Verifikasi binary
-      # ============================================================
       - name: Verify final binary
         run: |
-          set -eux
+          set -euxo pipefail
 
           BIN="$GITHUB_WORKSPACE/output/redsocks-patched"
 
           test -f "$BIN"
 
-          echo
-          echo "======================================"
-          echo "FILE:"
-          echo "======================================"
-
+          echo "=== FILE ==="
           file "$BIN"
 
-          echo
-          echo "======================================"
-          echo "SIZE:"
-          echo "======================================"
-
+          echo "=== SIZE ==="
           ls -lh "$BIN"
 
-          echo
-          echo "======================================"
-          echo "SHA256:"
-          echo "======================================"
-
+          echo "=== SHA256 ==="
           sha256sum "$BIN"
 
-          echo
-          echo "======================================"
-          echo "DEPENDENCIES:"
-          echo "======================================"
+          echo "=== ARCHITECTURE ==="
+          file "$BIN" | grep -qi MIPS
 
-          "$READELF" -d "$BIN" || true
-
-          echo
-          echo "======================================"
-          echo "CHECK HOST HEADER:"
-          echo "======================================"
-
+          echo "=== HOST HEADER ==="
           strings "$BIN" | grep 'Host:'
 
+          echo "=== ELF DEPENDENCIES ==="
+          "$READELF" -d "$BIN" || true
 
-      # ============================================================
-      # 11. Pastikan binary benar-benar MIPS
-      # ============================================================
-      - name: Architecture safety check
-        run: |
-          set -eux
-
-          RESULT="$(file "$GITHUB_WORKSPACE/output/redsocks-patched")"
-
-          echo "$RESULT"
-
-          echo "$RESULT" | grep -qi "MIPS"
-
-          echo
-          echo "======================================"
-          echo "BINARY MIPS VALID"
-          echo "======================================"
-
-
-      # ============================================================
-      # 12. Upload artifact
-      # ============================================================
       - name: Upload redsocks patched
         uses: actions/upload-artifact@v4
         with:
