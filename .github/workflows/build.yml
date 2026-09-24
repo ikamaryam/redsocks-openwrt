@@ -1,0 +1,116 @@
+name: Build Patched Redsocks for OpenWrt
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential wget xz-utils git file
+
+      - name: Download OpenWrt 19.07.10 SDK
+        run: |
+          wget -q --show-progress \
+            https://archive.openwrt.org/releases/19.07.10/targets/ramips/mt76x8/openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz
+
+          tar -xf openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz
+          mv openwrt-sdk-* sdk
+
+      - name: Prepare SDK feeds
+        working-directory: sdk
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install libevent
+
+      - name: Download redsocks source
+        run: |
+          git clone https://github.com/darkk/redsocks.git
+          cd redsocks
+          git checkout release-0.5 || git checkout v0.5 || true
+
+      - name: Patch HTTP CONNECT Host header
+        run: |
+          cd redsocks
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("http-connect.c")
+          s = p.read_text()
+
+          old = '"CONNECT %s:%u HTTP/1.0\\r\\n"'
+          new = '"CONNECT %s:%u HTTP/1.0\\r\\nHost: %s:%u\\r\\n\\r\\n"'
+
+          if old not in s:
+              raise SystemExit("CONNECT format string not found")
+
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          print("Patched CONNECT format:")
+          for line in s.splitlines():
+              if "CONNECT %s" in line:
+                  print(line)
+          PY
+
+      - name: Fix arguments for Host header
+        run: |
+          cd redsocks
+
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("http-connect.c")
+          s = p.read_text()
+
+          needle = 'evbuffer_add_printf(buff, "CONNECT %s:%u HTTP/1.0\\r\\nHost: %s:%u\\r\\n\\r\\n", host, ntohs(destaddr->sin_port));'
+
+          replacement = 'evbuffer_add_printf(buff, "CONNECT %s:%u HTTP/1.0\\r\\nHost: %s:%u\\r\\n\\r\\n", host, ntohs(destaddr->sin_port), host, ntohs(destaddr->sin_port));'
+
+          if needle in s:
+              s = s.replace(needle, replacement, 1)
+
+          p.write_text(s)
+          PY
+
+      - name: Cross compile
+        run: |
+          TOOLCHAIN=$(find "$GITHUB_WORKSPACE/sdk/staging_dir" -maxdepth 1 -type d -name 'toolchain-mipsel_24kc_gcc-*_musl' | head -1)
+
+          CC=$(find "$TOOLCHAIN/bin" -type f -name 'mipsel-openwrt-linux-musl-gcc' | head -1)
+
+          EVENT_INC=$(find "$GITHUB_WORKSPACE/sdk/staging_dir" -type d -path '*/usr/include' | head -1)
+          EVENT_LIB=$(find "$GITHUB_WORKSPACE/sdk/staging_dir" -type d -path '*/usr/lib' | head -1)
+
+          echo "Compiler: $CC"
+          echo "Include: $EVENT_INC"
+          echo "Library: $EVENT_LIB"
+
+          cd redsocks
+
+          make clean || true
+
+          make \
+            CC="$CC" \
+            CFLAGS="-Os -I$EVENT_INC" \
+            LDFLAGS="-L$EVENT_LIB" \
+            LIBS="-levent_core"
+
+          "$TOOLCHAIN/bin/mipsel-openwrt-linux-musl-strip" redsocks
+
+          file redsocks
+          ls -lh redsocks
+
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp redsocks "$GITHUB_WORKSPACE/output/redsocks-patched"
+
+      - name: Upload patched binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: redsocks-openwrt-mipsel-24kc
+          path: output/redsocks-patched
