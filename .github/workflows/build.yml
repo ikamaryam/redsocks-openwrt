@@ -11,30 +11,53 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential wget xz-utils git file
+          sudo apt-get install -y \
+            build-essential \
+            wget \
+            xz-utils \
+            git \
+            file \
+            python3
 
       - name: Download OpenWrt 19.07.10 SDK
         run: |
           wget -q --show-progress \
             https://archive.openwrt.org/releases/19.07.10/targets/ramips/mt76x8/openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz
 
-          tar -xf openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz
+          tar -xf \
+            openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64.tar.xz
 
           mv \
             openwrt-sdk-19.07.10-ramips-mt76x8_gcc-7.5.0_musl.Linux-x86_64 \
             sdk
 
-      - name: Prepare SDK feeds
+      - name: Configure OpenWrt feeds
         working-directory: sdk
+        env:
+          FORCE: "1"
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install libevent
+
+      - name: Build libevent in SDK
+        working-directory: sdk
+        env:
+          FORCE: "1"
+        run: |
+          make defconfig
+          make package/libevent/compile V=s -j2
 
       - name: Download redsocks source
         run: |
           git clone https://github.com/darkk/redsocks.git
           cd redsocks
-          git checkout release-0.5 || git checkout v0.5 || true
+
+          git checkout release-0.5 || \
+          git checkout v0.5 || \
+          true
+
+          echo "Original CONNECT code:"
+          grep -n -A 5 -B 3 'CONNECT %s' http-connect.c
 
       - name: Patch HTTP CONNECT Host header
         run: |
@@ -42,55 +65,65 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           p = Path("http-connect.c")
           s = p.read_text()
 
-          old = '''evbuffer_add_printf(buff, "CONNECT %s:%u HTTP/1.0\\r\\n", host, ntohs(destaddr->sin_port));'''
+          pattern = re.compile(
+              r'len\s*=\s*evbuffer_add_printf'
+              r'\(\s*buff\s*,\s*'
+              r'"CONNECT %s:%u HTTP/1\.0\\r\\n"\s*,'
+              r'\s*host\s*,\s*'
+              r'ntohs\s*\(\s*destaddr->sin_port\s*\)\s*'
+              r'\)\s*;',
+              re.MULTILINE
+          )
 
-          new = '''evbuffer_add_printf(
-              buff,
-              "CONNECT %s:%u HTTP/1.0\\r\\n"
-              "Host: %s:%u\\r\\n"
-              "\\r\\n",
-              host,
-              ntohs(destaddr->sin_port),
-              host,
-              ntohs(destaddr->sin_port)
-          );'''
+          replacement = '''len = evbuffer_add_printf(buff,
+                  "CONNECT %s:%u HTTP/1.0\\r\\n"
+                  "Host: %s:%u\\r\\n"
+                  "\\r\\n",
+                  host, ntohs(destaddr->sin_port),
+                  host, ntohs(destaddr->sin_port));'''
 
-          if old not in s:
-              print("Original CONNECT code was not found.")
-              print("Matching lines:")
-              for line in s.splitlines():
+          s2, count = pattern.subn(replacement, s, count=1)
+
+          if count != 1:
+              print("ERROR: CONNECT block could not be patched.")
+              print()
+              for i, line in enumerate(s.splitlines(), 1):
                   if "CONNECT %s" in line:
-                      print(line)
+                      start = max(0, i - 4)
+                      end = min(len(s.splitlines()), i + 6)
+                      for n in range(start, end):
+                          print(f"{n+1}: {s.splitlines()[n]}")
               raise SystemExit(1)
 
-          s = s.replace(old, new, 1)
-          p.write_text(s)
+          p.write_text(s2)
 
           print("Patch successful.")
           PY
 
-      - name: Verify patch
+      - name: Verify Host patch
         run: |
           grep -n -A 10 -B 3 'CONNECT %s' redsocks/http-connect.c
+          grep -n 'Host: %s' redsocks/http-connect.c
 
-      - name: Locate libevent
+      - name: Locate OpenWrt toolchain and libevent
         run: |
           export STAGING_DIR="$GITHUB_WORKSPACE/sdk/staging_dir"
 
+          echo "Toolchains:"
+          find "$STAGING_DIR" -maxdepth 1 -type d -name 'toolchain-*' -print
+
+          echo "event.h:"
           find "$STAGING_DIR" -name event.h -print
+
+          echo "libevent:"
           find "$STAGING_DIR" -name 'libevent_core.so*' -print
 
-          test -f \
-            "$STAGING_DIR/target-mipsel_24kc_musl/usr/include/event.h"
-
-          test -e \
-            "$STAGING_DIR/target-mipsel_24kc_musl/usr/lib/libevent_core.so"
-
-      - name: Cross compile
+      - name: Cross compile patched redsocks
         run: |
           export STAGING_DIR="$GITHUB_WORKSPACE/sdk/staging_dir"
 
@@ -100,14 +133,21 @@ jobs:
           CC="$TOOLCHAIN/bin/mipsel-openwrt-linux-musl-gcc"
           STRIP="$TOOLCHAIN/bin/mipsel-openwrt-linux-musl-strip"
 
+          test -x "$CC"
+          test -x "$STRIP"
+          test -f "$TARGET/usr/include/event.h"
+
+          EVENTLIB="$(find "$TARGET/usr/lib" \
+            -name 'libevent_core.so*' \
+            -print -quit)"
+
+          test -n "$EVENTLIB"
+
           echo "Compiler:"
           "$CC" --version
 
-          echo "Target include:"
-          ls -l "$TARGET/usr/include/event.h"
-
-          echo "Target library:"
-          ls -l "$TARGET/usr/lib/libevent_core.so"*
+          echo "libevent:"
+          echo "$EVENTLIB"
 
           cd redsocks
 
@@ -121,18 +161,16 @@ jobs:
 
           "$STRIP" redsocks
 
-          echo "Result:"
-          file redsocks
-          ls -lh redsocks
-
           mkdir -p "$GITHUB_WORKSPACE/output"
           cp redsocks "$GITHUB_WORKSPACE/output/redsocks-patched"
 
-      - name: Verify binary
+      - name: Verify compiled binary
         run: |
           file output/redsocks-patched
           ls -lh output/redsocks-patched
           sha256sum output/redsocks-patched
+
+          strings output/redsocks-patched | grep -A 2 'CONNECT %s' || true
 
       - name: Upload patched binary
         uses: actions/upload-artifact@v4
