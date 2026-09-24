@@ -44,8 +44,8 @@ jobs:
         env:
           FORCE: "1"
         run: |
-          make defconfig
-          make package/libevent/compile V=s -j2
+          make FORCE=1 defconfig
+          make FORCE=1 package/libevent/compile V=s -j2
 
       - name: Download redsocks source
         run: |
