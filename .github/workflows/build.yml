@@ -78,18 +78,21 @@ jobs:
           p.write_text(s)
           PY
 
-      - name: Cross compile
+           - name: Cross compile
         run: |
-          TOOLCHAIN=$(find "$GITHUB_WORKSPACE/sdk/staging_dir" -maxdepth 1 -type d -name 'toolchain-mipsel_24kc_gcc-*_musl' | head -1)
+          TOOLCHAIN="$GITHUB_WORKSPACE/sdk/staging_dir/toolchain-mipsel_24kc_gcc-7.5.0_musl"
+          TARGET="$GITHUB_WORKSPACE/sdk/staging_dir/target-mipsel_24kc_musl"
 
-          CC=$(find "$TOOLCHAIN/bin" -type f -name 'mipsel-openwrt-linux-musl-gcc' | head -1)
+          export STAGING_DIR="$GITHUB_WORKSPACE/sdk/staging_dir"
 
-          EVENT_INC=$(find "$GITHUB_WORKSPACE/sdk/staging_dir" -type d -path '*/usr/include' | head -1)
-          EVENT_LIB=$(find "$GITHUB_WORKSPACE/sdk/staging_dir" -type d -path '*/usr/lib' | head -1)
+          CC="$TOOLCHAIN/bin/mipsel-openwrt-linux-musl-gcc"
+          STRIP="$TOOLCHAIN/bin/mipsel-openwrt-linux-musl-strip"
 
           echo "Compiler: $CC"
-          echo "Include: $EVENT_INC"
-          echo "Library: $EVENT_LIB"
+          echo "Target: $TARGET"
+
+          test -f "$TARGET/usr/include/event.h"
+          test -f "$TARGET/usr/lib/libevent_core.so"
 
           cd redsocks
 
@@ -97,18 +100,18 @@ jobs:
 
           make \
             CC="$CC" \
-            CFLAGS="-Os -I$EVENT_INC" \
-            LDFLAGS="-L$EVENT_LIB" \
+            CFLAGS="-Os -I$TARGET/usr/include" \
+            LDFLAGS="-L$TARGET/usr/lib" \
             LIBS="-levent_core"
 
-          "$TOOLCHAIN/bin/mipsel-openwrt-linux-musl-strip" redsocks
+          "$STRIP" redsocks
 
           file redsocks
           ls -lh redsocks
 
           mkdir -p "$GITHUB_WORKSPACE/output"
           cp redsocks "$GITHUB_WORKSPACE/output/redsocks-patched"
-
+          
       - name: Upload patched binary
         uses: actions/upload-artifact@v4
         with:
